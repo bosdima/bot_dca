@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-DCA Bybit Trading Bot - ИСПРАВЛЕННАЯ ВЕРСИЯ для Windows
+DCA Bybit Trading Bot - ИСПРАВЛЕННАЯ ВЕРСИЯ
 """
 
 import os
@@ -1222,7 +1222,8 @@ class FastDCABot:
                 message += f"🪙 *{coin}*\n"
                 message += f"Количество: `{equity:.6f}`\n"
                 message += f"Доступно: `{available:.6f}`\n"
-                message += f"Стоимость: `{usd_value:.2f}` USDT\n"
+                if usd_value > 0:
+                    message += f"Стоимость: `{usd_value:.2f}` USDT\n"
                 if avg_price > 0:
                     message += f"Средняя цена входа: `{avg_price:.2f}` USDT\n"
                 if current_price:
@@ -1542,7 +1543,7 @@ class FastDCABot:
             price = float(order.get('price', 0))
             qty = float(order.get('qty', 0))
             keyboard.append([InlineKeyboardButton(
-                f"✏️ Изменить #{i}", 
+                f"✏️ Изменить #{i} ({price:.2f})", 
                 callback_data=f"order_edit_{order_id}_{price}_{qty}"
             )])
         
@@ -1609,7 +1610,7 @@ class FastDCABot:
         await update.callback_query.edit_message_text(
             f"✏️ Введите новую цену (текущая: {current_price:.2f}):"
         )
-        context.user_data['current_state'] = EDIT_ORDER_PRICE
+        return EDIT_ORDER_PRICE
     
     async def edit_order_done(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Завершить изменение цены"""
