@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-DCA Bybit Trading Bot - ИСПРАВЛЕННАЯ ВЕРСИЯ с экспортом/импортом
+DCA Bybit Trading Bot - ИСПРАВЛЕННАЯ ВЕРСИЯ
 """
 
 import os
@@ -86,7 +86,7 @@ BYBIT_TESTNET = os.getenv('BYBIT_TESTNET', 'false').lower() == 'true'
     WAITING_ALERT_PERCENT,
     WAITING_ALERT_INTERVAL,
     WAITING_IMPORT_FILE,
-) = range(23)  # 23 состояния
+) = range(23)
 
 # Файл для экспорта/импорта
 DB_EXPORT_FILE = 'dca_data_export.json'
@@ -849,6 +849,9 @@ class BybitClient:
         self.testnet = testnet
         self.session = None
         self.account_type = None
+        self._price_cache = {}
+        self._cache_time = {}
+        self._cache_ttl = 5  # 5 секунд кэш
         self._init_session()
     
     def _init_session(self):
@@ -877,15 +880,23 @@ class BybitClient:
         except Exception as e:
             return False, f"❌ Bybit API ошибка подключения: {str(e)}"
     
-    @lru_cache(maxsize=10)
     async def get_symbol_price(self, symbol: str) -> Optional[float]:
-        """Получить текущую цену (с кэшированием)"""
+        """Получить текущую цену с простым кэшированием"""
+        # Проверяем кэш
+        now = time.time()
+        if symbol in self._cache_time and now - self._cache_time.get(symbol, 0) < self._cache_ttl:
+            return self._price_cache.get(symbol)
+        
         try:
             if not self.session:
                 self._init_session()
             response = self.session.get_tickers(category="spot", symbol=symbol)
             if response['retCode'] == 0 and response['result']['list']:
-                return float(response['result']['list'][0]['lastPrice'])
+                price = float(response['result']['list'][0]['lastPrice'])
+                # Сохраняем в кэш
+                self._price_cache[symbol] = price
+                self._cache_time[symbol] = now
+                return price
             return None
         except Exception as e:
             logger.error(f"Error getting price for {symbol}: {e}")
@@ -1555,62 +1566,67 @@ class FastDCABot:
             await update.message.reply_text("❌ Bybit API не инициализирован. Проверьте API ключи в .env файле.")
             return
         
-        symbol = self.db.get_setting('symbol', 'BTCUSDT')
-        coin = symbol.replace('USDT', '')
-        
-        stats = self.db.get_dca_stats(symbol)
-        current_price = await self.bybit.get_symbol_price(symbol)
-        dca_start = self.db.get_dca_start()
-        
-        if not stats:
-            await update.message.reply_text(
-                "📈 *Статистика DCA*\n\nПокупок пока нет.",
-                parse_mode='Markdown'
-            )
-            return
-        
-        total_amount = stats['total_quantity']
-        total_cost = stats['total_usdt']
-        avg_price = stats['avg_price']
-        current_value = total_amount * current_price if current_price else 0
-        pnl = current_value - total_cost
-        pnl_percent = (pnl / total_cost * 100) if total_cost > 0 else 0
-        
-        start_date_str = "Неизвестно"
-        if dca_start:
-            try:
-                start_date = datetime.fromisoformat(dca_start['start_date'].replace('Z', '+00:00'))
-                start_date_str = start_date.strftime('%d.%m.%Y')
-            except:
-                start_date_str = dca_start['start_date']
-        
-        pnl_emoji = "📈" if pnl >= 0 else "📉"
-        pnl_sign = "+" if pnl >= 0 else ""
-        
-        text = f"📊 *ДЕТАЛЬНАЯ СТАТИСТИКА DCA*\n\n"
-        text += f"📅 Начало: `{start_date_str}`\n"
-        text += f"💰 Куплено: `{total_amount:.6f}` {coin}\n"
-        text += f"💵 Средняя цена: `{avg_price:.2f}` USDT\n"
-        text += f"💵 Инвестировано: `{total_cost:.2f}` USDT\n"
-        
-        if current_price:
-            text += f"📈 Текущая цена: `{current_price:.2f}` USDT\n"
-            text += f"💰 Текущая стоимость: `{current_value:.2f}` USDT\n"
-            text += f"{pnl_emoji} Текущий PnL: `{pnl:.2f}` USDT ({pnl_sign}{pnl_percent:.2f}%)\n"
-        
-        text += f"📊 Всего сделок: `{stats['total_purchases']}`\n"
-        
-        profit_percent = float(self.db.get_setting('profit_percent', '5'))
-        target_price = avg_price * (1 + profit_percent / 100)
-        target_value = total_amount * target_price
-        target_pnl = target_value - total_cost
-        
-        text += f"\n🎯 *ЦЕЛЕВАЯ ПРИБЫЛЬ {profit_percent}%:*\n"
-        text += f"Продать `{total_amount:.6f}` {coin} по цене `{target_price:.2f}` USDT\n"
-        text += f"Получите: `{target_value:.2f}` USDT\n"
-        text += f"Прибыль: `{target_pnl:.2f}` USDT"
-        
-        await update.message.reply_text(text, parse_mode='Markdown')
+        try:
+            symbol = self.db.get_setting('symbol', 'BTCUSDT')
+            coin = symbol.replace('USDT', '')
+            
+            stats = self.db.get_dca_stats(symbol)
+            current_price = await self.bybit.get_symbol_price(symbol)
+            dca_start = self.db.get_dca_start()
+            
+            if not stats:
+                await update.message.reply_text(
+                    "📈 *Статистика DCA*\n\nПокупок пока нет.",
+                    parse_mode='Markdown'
+                )
+                return
+            
+            total_amount = stats['total_quantity']
+            total_cost = stats['total_usdt']
+            avg_price = stats['avg_price']
+            current_value = total_amount * current_price if current_price else 0
+            pnl = current_value - total_cost
+            pnl_percent = (pnl / total_cost * 100) if total_cost > 0 else 0
+            
+            start_date_str = "Неизвестно"
+            if dca_start:
+                try:
+                    start_date = datetime.fromisoformat(dca_start['start_date'].replace('Z', '+00:00'))
+                    start_date_str = start_date.strftime('%d.%m.%Y')
+                except:
+                    start_date_str = dca_start['start_date']
+            
+            pnl_emoji = "📈" if pnl >= 0 else "📉"
+            pnl_sign = "+" if pnl >= 0 else ""
+            
+            text = f"📊 *ДЕТАЛЬНАЯ СТАТИСТИКА DCA*\n\n"
+            text += f"📅 Начало: `{start_date_str}`\n"
+            text += f"💰 Куплено: `{total_amount:.6f}` {coin}\n"
+            text += f"💵 Средняя цена: `{avg_price:.2f}` USDT\n"
+            text += f"💵 Инвестировано: `{total_cost:.2f}` USDT\n"
+            
+            if current_price:
+                text += f"📈 Текущая цена: `{current_price:.2f}` USDT\n"
+                text += f"💰 Текущая стоимость: `{current_value:.2f}` USDT\n"
+                text += f"{pnl_emoji} Текущий PnL: `{pnl:.2f}` USDT ({pnl_sign}{pnl_percent:.2f}%)\n"
+            
+            text += f"📊 Всего сделок: `{stats['total_purchases']}`\n"
+            
+            profit_percent = float(self.db.get_setting('profit_percent', '5'))
+            target_price = avg_price * (1 + profit_percent / 100)
+            target_value = total_amount * target_price
+            target_pnl = target_value - total_cost
+            
+            text += f"\n🎯 *ЦЕЛЕВАЯ ПРИБЫЛЬ {profit_percent}%:*\n"
+            text += f"Продать `{total_amount:.6f}` {coin} по цене `{target_price:.2f}` USDT\n"
+            text += f"Получите: `{target_value:.2f}` USDT\n"
+            text += f"Прибыль: `{target_pnl:.2f}` USDT"
+            
+            await update.message.reply_text(text, parse_mode='Markdown')
+            
+        except Exception as e:
+            logger.error(f"Error in show_dca_stats_detailed: {e}")
+            await update.message.reply_text(f"❌ Ошибка: {str(e)}")
     
     async def show_status(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Показать статус бота"""
@@ -2996,6 +3012,10 @@ class FastDCABot:
                     MessageHandler(filters.Regex('^(📤 Экспорт базы)$'), self.export_database_handler),
                     MessageHandler(filters.Regex('^(📥 Импорт базы)$'), self.import_database_start),
                     MessageHandler(filters.Regex('^(🔙 Назад в меню)$'), self.back_to_main),
+                    MessageHandler(filters.Regex('^(📊 Процент для уведомления)$'), self.set_alert_percent_start),
+                    MessageHandler(filters.Regex('^(⏱ Частота проверки)$'), self.set_alert_interval_start),
+                    MessageHandler(filters.Regex('^(🔔 Вкл/Выкл уведомления)$'), self.toggle_notifications),
+                    MessageHandler(filters.Regex('^(📋 Текущие настройки)$'), self.show_current_notification_settings),
                 ],
                 SET_SYMBOL: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.set_symbol_done)],
                 SET_AMOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.set_amount_done)],
