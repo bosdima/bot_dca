@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 DCA Bybit Trading Bot - МАРТИНГЕЙЛ ЛЕСЕНКОЙ
-Исправленная версия с детальной статистикой и разделением ордеров
+С сохранением данных и улучшенным отображением ордеров
 """
 
 import os
@@ -128,7 +128,7 @@ class Database:
         self.init_db()
     
     def init_db(self):
-        """Быстрая инициализация БД"""
+        """Инициализация БД"""
         try:
             conn = sqlite3.connect(self.db_file, timeout=10)
             cursor = conn.cursor()
@@ -253,7 +253,7 @@ class Database:
             
             conn.commit()
             conn.close()
-            logger.info("Database initialized successfully")
+            logger.info(f"Database initialized successfully at {self.db_file}")
         except Exception as e:
             logger.error(f"DB init error: {e}")
     
@@ -1349,33 +1349,36 @@ class FastDCABot:
             # Ордера на продажу
             sell_orders = orders_by_side.get('sell', [])
             if sell_orders:
-                message += f"📋 *Ордера на ПРОДАЖУ ({len(sell_orders)})*\n"
-                for order in sell_orders[:5]:
+                message += f"🔴 *ОРДЕРА НА ПРОДАЖУ ({len(sell_orders)})*\n"
+                for order in sell_orders[:10]:
+                    order_id = order.get('orderId', 'N/A')
                     price = float(order.get('price', 0))
                     qty = float(order.get('qty', 0))
-                    message += f"🔴 Продажа: `{format_quantity(qty, 6)}` @ `{format_price(price, 4)}`\n"
-                if len(sell_orders) > 5:
-                    message += f"_...и еще {len(sell_orders) - 5}_\n"
+                    message += f"`{order_id}` - `{format_quantity(qty, 6)}` {coin} @ `{format_price(price, 4)}` USDT\n"
+                if len(sell_orders) > 10:
+                    message += f"_...и еще {len(sell_orders) - 10}_\n"
                 message += f"\n"
             else:
-                message += f"📋 *Нет ордеров на продажу*\n\n"
+                message += f"🔴 *Нет ордеров на продажу*\n\n"
             
             # Ордера на покупку
             buy_orders = orders_by_side.get('buy', [])
             if buy_orders:
-                message += f"📋 *Ордера на ПОКУПКУ ({len(buy_orders)})*\n"
-                for order in buy_orders[:5]:
+                message += f"🟢 *ОРДЕРА НА ПОКУПКУ ({len(buy_orders)})*\n"
+                for order in buy_orders[:10]:
+                    order_id = order.get('orderId', 'N/A')
                     price = float(order.get('price', 0))
                     qty = float(order.get('qty', 0))
-                    message += f"🟢 Покупка: `{format_quantity(qty, 6)}` @ `{format_price(price, 4)}`\n"
-                if len(buy_orders) > 5:
-                    message += f"_...и еще {len(buy_orders) - 5}_\n"
+                    message += f"`{order_id}` - `{format_quantity(qty, 6)}` {coin} @ `{format_price(price, 4)}` USDT\n"
+                if len(buy_orders) > 10:
+                    message += f"_...и еще {len(buy_orders) - 10}_\n"
             else:
-                message += f"📋 *Нет ордеров на покупку*"
+                message += f"🟢 *Нет ордеров на покупку*"
             
             await update.message.reply_text(message, parse_mode='Markdown')
             
         except Exception as e:
+            logger.error(f"Error in show_portfolio: {e}")
             await update.message.reply_text(f"❌ Ошибка: {str(e)}")
     
     async def show_dca_stats_detailed(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1426,7 +1429,6 @@ class FastDCABot:
                 text += f"Получите: `{target_info['target_value']:.2f}` USDT\n"
                 text += f"Прибыль: `{target_info['target_profit']:.2f}` USDT\n"
                 
-                # Информация о том, на сколько нужно вырасти
                 if current_price:
                     increase_needed = ((target_info['target_price'] - current_price) / current_price * 100)
                     text += f"Нужен рост: `{increase_needed:+.2f}%` от текущей цены\n"
@@ -1775,6 +1777,7 @@ class FastDCABot:
             await update.message.reply_text("❌ Bybit API не инициализирован.")
             return MANAGE_ORDERS
         symbol = self.db.get_setting('symbol', 'TONUSDT')
+        coin = symbol.replace('USDT', '')
         orders_by_side = await self.bybit.get_open_orders_by_side(symbol)
         
         message = f"📋 *СПИСОК ОРДЕРОВ*\n\n"
@@ -1783,11 +1786,13 @@ class FastDCABot:
         sell_orders = orders_by_side.get('sell', [])
         if sell_orders:
             message += f"🔴 *ОРДЕРА НА ПРОДАЖУ ({len(sell_orders)})*\n"
-            for i, order in enumerate(sell_orders[:10], 1):
+            for i, order in enumerate(sell_orders[:20], 1):
+                order_id = order.get('orderId', 'N/A')
                 price = float(order.get('price', 0))
                 qty = float(order.get('qty', 0))
-                order_id = order.get('orderId', 'N/A')[:8]
-                message += f"{i}. `{order_id}` - {format_quantity(qty, 6)} @ {format_price(price, 4)}\n"
+                message += f"{i}. `{order_id}` - `{format_quantity(qty, 6)}` {coin} @ `{format_price(price, 4)}` USDT\n"
+            if len(sell_orders) > 20:
+                message += f"_...и еще {len(sell_orders) - 20}_\n"
             message += f"\n"
         else:
             message += f"🔴 *Нет ордеров на продажу*\n\n"
@@ -1796,11 +1801,13 @@ class FastDCABot:
         buy_orders = orders_by_side.get('buy', [])
         if buy_orders:
             message += f"🟢 *ОРДЕРА НА ПОКУПКУ ({len(buy_orders)})*\n"
-            for i, order in enumerate(buy_orders[:10], 1):
+            for i, order in enumerate(buy_orders[:20], 1):
+                order_id = order.get('orderId', 'N/A')
                 price = float(order.get('price', 0))
                 qty = float(order.get('qty', 0))
-                order_id = order.get('orderId', 'N/A')[:8]
-                message += f"{i}. `{order_id}` - {format_quantity(qty, 6)} @ {format_price(price, 4)}\n"
+                message += f"{i}. `{order_id}` - `{format_quantity(qty, 6)}` {coin} @ `{format_price(price, 4)}` USDT\n"
+            if len(buy_orders) > 20:
+                message += f"_...и еще {len(buy_orders) - 20}_\n"
         else:
             message += f"🟢 *Нет ордеров на покупку*"
         
@@ -1815,17 +1822,20 @@ class FastDCABot:
             await update.message.reply_text("❌ Bybit API не инициализирован.")
             return MANAGE_ORDERS
         symbol = self.db.get_setting('symbol', 'TONUSDT')
+        coin = symbol.replace('USDT', '')
         open_orders = await self.bybit.get_open_orders(symbol)
         if not open_orders:
             await update.message.reply_text("❌ Нет открытых ордеров", reply_markup=self.get_orders_management_keyboard())
             return MANAGE_ORDERS
         keyboard = []
-        for i, order in enumerate(open_orders[:10], 1):
+        for i, order in enumerate(open_orders[:20], 1):
             order_id = order.get('orderId', 'N/A')
             price = float(order.get('price', 0))
+            qty = float(order.get('qty', 0))
             side = order.get('side', 'Unknown')
             side_emoji = "🔴" if side == "Sell" else "🟢"
-            keyboard.append([InlineKeyboardButton(f"{side_emoji} Удалить #{i} ({format_price(price, 4)})", callback_data=f"order_delete_{order_id}")])
+            side_text = "Продажа" if side == "Sell" else "Покупка"
+            keyboard.append([InlineKeyboardButton(f"{side_emoji} Удалить #{i} - {side_text} {format_quantity(qty, 6)} {coin} @ {format_price(price, 4)}", callback_data=f"order_delete_{order_id}")])
         keyboard.append([InlineKeyboardButton("🔙 Отмена", callback_data="order_cancel")])
         await update.message.reply_text("❌ *Выберите ордер для удаления:*", reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
         return MANAGE_ORDERS
@@ -1838,18 +1848,20 @@ class FastDCABot:
             await update.message.reply_text("❌ Bybit API не инициализирован.")
             return MANAGE_ORDERS
         symbol = self.db.get_setting('symbol', 'TONUSDT')
+        coin = symbol.replace('USDT', '')
         open_orders = await self.bybit.get_open_orders(symbol)
         if not open_orders:
             await update.message.reply_text("❌ Нет открытых ордеров", reply_markup=self.get_orders_management_keyboard())
             return MANAGE_ORDERS
         keyboard = []
-        for i, order in enumerate(open_orders[:10], 1):
+        for i, order in enumerate(open_orders[:20], 1):
             order_id = order.get('orderId', 'N/A')
             price = float(order.get('price', 0))
             qty = float(order.get('qty', 0))
             side = order.get('side', 'Unknown')
             side_emoji = "🔴" if side == "Sell" else "🟢"
-            keyboard.append([InlineKeyboardButton(f"{side_emoji} Изменить #{i} ({format_price(price, 4)})", callback_data=f"order_edit_{order_id}_{price}_{qty}")])
+            side_text = "Продажа" if side == "Sell" else "Покупка"
+            keyboard.append([InlineKeyboardButton(f"{side_emoji} Изменить #{i} - {side_text} {format_quantity(qty, 6)} {coin} @ {format_price(price, 4)}", callback_data=f"order_edit_{order_id}_{price}_{qty}")])
         keyboard.append([InlineKeyboardButton("🔙 Отмена", callback_data="order_cancel")])
         await update.message.reply_text("✏️ *Выберите ордер для изменения цены:*", reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
         return MANAGE_ORDERS
@@ -2671,6 +2683,7 @@ class FastDCABot:
         print(f"{Fore.GREEN}✅ Токен: {TELEGRAM_TOKEN[:10]}...{TELEGRAM_TOKEN[-5:]}")
         print(f"{Fore.WHITE}👤 Пользователь: {AUTHORIZED_USER}")
         print(f"{Fore.WHITE}🌐 Testnet: {'Да' if BYBIT_TESTNET else 'Нет'}")
+        print(f"{Fore.WHITE}💾 База данных: dca_bot.db (данные сохраняются)")
         print(f"{Fore.CYAN}{'='*60}\n")
         
         self.application.post_init = self.post_init
