@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 DCA Bybit Trading Bot - МАРТИНГЕЙЛ ЛЕСЕНКОЙ
-Исправленная версия с работающим меню лестницы
+Исправленная версия с детальной статистикой и разделением ордеров
 """
 
 import os
@@ -452,7 +452,7 @@ class Database:
             logger.error(f"Error adding sell order: {e}")
     
     def get_active_sell_orders(self, symbol: str = None) -> List[Dict]:
-        """Получить активные ордера"""
+        """Получить активные ордера на продажу"""
         try:
             conn = sqlite3.connect(self.db_file, timeout=5)
             conn.row_factory = sqlite3.Row
@@ -945,6 +945,7 @@ class BybitClient:
             return {'error': str(e)}
     
     async def get_open_orders(self, symbol: str = None) -> List[Dict]:
+        """Получить открытые ордера"""
         try:
             if not self.session:
                 self._init_session()
@@ -958,6 +959,13 @@ class BybitClient:
         except Exception as e:
             logger.error(f"Error getting open orders: {e}")
             return []
+    
+    async def get_open_orders_by_side(self, symbol: str = None) -> Dict[str, List[Dict]]:
+        """Получить открытые ордера с разделением по сторонам"""
+        orders = await self.get_open_orders(symbol)
+        buy_orders = [o for o in orders if o.get('side') == 'Buy']
+        sell_orders = [o for o in orders if o.get('side') == 'Sell']
+        return {'buy': buy_orders, 'sell': sell_orders}
     
     async def cancel_order(self, symbol: str, order_id: str) -> Dict:
         try:
@@ -1127,6 +1135,27 @@ class DCAStrategy:
         else:
             return {'success': True, 'should_buy': False, 'reason': ladder_info['reason'],
                    'current_price': current_price, 'next_buy_price': ladder_info['target_price']}
+    
+    def calculate_target_info(self, stats: Dict, profit_percent: float) -> Dict:
+        """Рассчитать информацию о целевой продаже"""
+        if not stats or stats['total_quantity'] <= 0:
+            return None
+        
+        total_qty = stats['total_quantity']
+        avg_price = stats['avg_price']
+        target_price = avg_price * (1 + profit_percent / 100)
+        target_value = total_qty * target_price
+        total_cost = stats['total_usdt']
+        target_profit = target_value - total_cost
+        
+        return {
+            'target_price': target_price,
+            'target_value': target_value,
+            'target_profit': target_profit,
+            'total_qty': total_qty,
+            'avg_price': avg_price,
+            'profit_percent': profit_percent
+        }
 
 
 # ==================== FAST DCA BOT ====================
@@ -1277,15 +1306,75 @@ class FastDCABot:
             coin_balance = await self.bybit.get_balance(coin)
             usdt_balance = await self.bybit.get_balance('USDT')
             current_price = await self.bybit.get_symbol_price(symbol)
+            
             message = f"📊 *Мой Портфель*\n\n"
+            
             if usdt_balance and 'equity' in usdt_balance:
-                message += f"💵 USDT доступно: `{usdt_balance.get('available', 0):.2f}`\n\n"
+                available_usdt = usdt_balance.get('available', usdt_balance.get('equity', 0))
+                message += f"💵 USDT доступно: `{available_usdt:.2f}`\n\n"
+            
             if coin_balance and 'equity' in coin_balance:
                 equity = coin_balance['equity']
-                message += f"🪙 *{coin}*\nКоличество: `{format_quantity(equity, 6)}`\n"
+                available = coin_balance.get('available', 0)
+                usd_value = coin_balance.get('usdValue', 0)
+                
+                if usd_value == 0 and current_price and equity > 0:
+                    usd_value = equity * current_price
+                
+                dca_stats = self.db.get_dca_stats(symbol)
+                avg_price = dca_stats['avg_price'] if dca_stats else 0
+                
+                if avg_price > 0 and current_price and equity > 0:
+                    pnl_percent = ((current_price - avg_price) / avg_price * 100)
+                    pnl_usd = (current_price - avg_price) * equity
+                else:
+                    pnl_percent = 0
+                    pnl_usd = 0
+                
+                emoji = "🟢" if pnl_percent >= 0 else "🔴"
+                
+                message += f"🪙 *{coin}*\n"
+                message += f"Количество: `{format_quantity(equity, 6)}`\n"
+                message += f"Доступно: `{format_quantity(available, 6)}`\n"
+                message += f"Стоимость: `{usd_value:.2f}` USDT\n"
+                if avg_price > 0:
+                    message += f"Средняя цена входа: `{format_price(avg_price, 4)}` USDT\n"
                 if current_price:
                     message += f"Текущая цена: `{format_price(current_price, 4)}` USDT\n"
+                    message += f"{emoji} PnL: `{pnl_percent:+.2f}%` ({pnl_usd:+.2f} USDT)\n\n"
+            
+            # Получаем ордера с разделением
+            orders_by_side = await self.bybit.get_open_orders_by_side(symbol)
+            
+            # Ордера на продажу
+            sell_orders = orders_by_side.get('sell', [])
+            if sell_orders:
+                message += f"📋 *Ордера на ПРОДАЖУ ({len(sell_orders)})*\n"
+                for order in sell_orders[:5]:
+                    price = float(order.get('price', 0))
+                    qty = float(order.get('qty', 0))
+                    message += f"🔴 Продажа: `{format_quantity(qty, 6)}` @ `{format_price(price, 4)}`\n"
+                if len(sell_orders) > 5:
+                    message += f"_...и еще {len(sell_orders) - 5}_\n"
+                message += f"\n"
+            else:
+                message += f"📋 *Нет ордеров на продажу*\n\n"
+            
+            # Ордера на покупку
+            buy_orders = orders_by_side.get('buy', [])
+            if buy_orders:
+                message += f"📋 *Ордера на ПОКУПКУ ({len(buy_orders)})*\n"
+                for order in buy_orders[:5]:
+                    price = float(order.get('price', 0))
+                    qty = float(order.get('qty', 0))
+                    message += f"🟢 Покупка: `{format_quantity(qty, 6)}` @ `{format_price(price, 4)}`\n"
+                if len(buy_orders) > 5:
+                    message += f"_...и еще {len(buy_orders) - 5}_\n"
+            else:
+                message += f"📋 *Нет ордеров на покупку*"
+            
             await update.message.reply_text(message, parse_mode='Markdown')
+            
         except Exception as e:
             await update.message.reply_text(f"❌ Ошибка: {str(e)}")
     
@@ -1301,33 +1390,62 @@ class FastDCABot:
             coin = symbol.replace('USDT', '')
             stats = self.db.get_dca_stats(symbol)
             current_price = await self.bybit.get_symbol_price(symbol)
-            ladder_summary = self.db.get_ladder_summary(symbol)
+            profit_percent = float(self.db.get_setting('profit_percent', '5'))
+            
             if not stats:
                 await update.message.reply_text("📈 *Статистика DCA*\n\nПокупок пока нет.", parse_mode='Markdown')
                 return
+            
             total_amount = stats['total_quantity']
             total_cost = stats['total_usdt']
             avg_price = stats['avg_price']
             current_value = total_amount * current_price if current_price else 0
             pnl = current_value - total_cost
             pnl_percent = (pnl / total_cost * 100) if total_cost > 0 else 0
+            
+            # Информация о целевой продаже
+            target_info = self.strategy.calculate_target_info(stats, profit_percent)
+            
             text = f"📊 *ДЕТАЛЬНАЯ СТАТИСТИКА DCA*\n\n"
+            text += f"🪙 Токен: `{symbol}`\n"
             text += f"💰 Куплено: `{format_quantity(total_amount, 6)}` {coin}\n"
-            text += f"💵 Средняя цена: `{format_price(avg_price, 4)}` USDT\n"
             text += f"💵 Инвестировано: `{total_cost:.2f}` USDT\n"
+            text += f"📈 Средняя цена входа: `{format_price(avg_price, 4)}` USDT\n"
+            
             if current_price:
-                text += f"📈 Текущая цена: `{format_price(current_price, 4)}` USDT\n"
+                text += f"\n📊 *ТЕКУЩАЯ СИТУАЦИЯ*\n"
+                text += f"📉 Текущая цена: `{format_price(current_price, 4)}` USDT\n"
                 text += f"💰 Текущая стоимость: `{current_value:.2f}` USDT\n"
                 emoji = "📈" if pnl >= 0 else "📉"
-                text += f"{emoji} PnL: `{pnl:.2f}` USDT ({pnl_percent:+.2f}%)\n"
+                text += f"{emoji} Текущий PnL: `{pnl:.2f}` USDT ({pnl_percent:+.2f}%)\n"
+            
+            if target_info:
+                text += f"\n🎯 *ЦЕЛЕВАЯ ПРИБЫЛЬ {profit_percent}%:*\n"
+                text += f"Нужно продать: `{format_quantity(target_info['total_qty'], 6)}` {coin}\n"
+                text += f"Цена продажи: `{format_price(target_info['target_price'], 4)}` USDT\n"
+                text += f"Получите: `{target_info['target_value']:.2f}` USDT\n"
+                text += f"Прибыль: `{target_info['target_profit']:.2f}` USDT\n"
+                
+                # Информация о том, на сколько нужно вырасти
+                if current_price:
+                    increase_needed = ((target_info['target_price'] - current_price) / current_price * 100)
+                    text += f"Нужен рост: `{increase_needed:+.2f}%` от текущей цены\n"
+            
+            # Информация о лестнице
+            ladder_summary = self.db.get_ladder_summary(symbol)
             if ladder_summary and ladder_summary['start_price'] > 0:
-                text += f"\n🪜 *ЛЕСТНИЦА*\n"
-                text += f"Старт: `{format_price(ladder_summary['start_price'], 4)}` USDT\n"
-                text += f"Шаг: `{ladder_summary['step_percent']}%` | Ступеней: `{ladder_summary['steps_count']}`\n"
-                text += f"Множитель: `x{ladder_summary['multiplier']}` | База: `{ladder_summary['base_amount']}` USDT\n"
+                text += f"\n🪜 *НАСТРОЙКИ ЛЕСТНИЦЫ*\n"
+                text += f"Стартовая цена: `{format_price(ladder_summary['start_price'], 4)}` USDT\n"
+                text += f"Шаг падения: `{ladder_summary['step_percent']}%`\n"
+                text += f"Количество ступеней: `{ladder_summary['steps_count']}`\n"
+                text += f"Множитель суммы: `x{ladder_summary['multiplier']}`\n"
+                text += f"Базовая сумма: `{ladder_summary['base_amount']}` USDT\n"
                 text += f"Текущий шаг: `{ladder_summary['current_step']}/{ladder_summary['steps_count']}`"
+            
             await update.message.reply_text(text, parse_mode='Markdown')
+            
         except Exception as e:
+            logger.error(f"Error in show_dca_stats_detailed: {e}")
             await update.message.reply_text(f"❌ Ошибка: {str(e)}")
     
     async def show_status(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1390,7 +1508,6 @@ class FastDCABot:
     # ============= НАСТРОЙКИ ЛЕСТНИЦЫ =============
     
     async def ladder_settings_menu(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Меню настроек лестницы - ВОЗВРАЩАЕТ LADDER_MENU"""
         if not await self._check_user_fast(update):
             return ConversationHandler.END
         
@@ -1404,7 +1521,6 @@ class FastDCABot:
         return LADDER_MENU
     
     async def show_ladder_settings(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Показать текущие настройки лестницы"""
         if not await self._check_user_fast(update):
             return LADDER_MENU
         
@@ -1432,11 +1548,7 @@ class FastDCABot:
     async def set_ladder_start_price_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not await self._check_user_fast(update):
             return LADDER_MENU
-        await update.message.reply_text(
-            f"💰 Введите новую стартовую цену (USDT):",
-            reply_markup=self.get_cancel_keyboard(),
-            parse_mode='Markdown'
-        )
+        await update.message.reply_text("💰 Введите новую стартовую цену (USDT):", reply_markup=self.get_cancel_keyboard(), parse_mode='Markdown')
         return SET_LADDER_START_PRICE
     
     async def set_ladder_start_price_save(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1463,11 +1575,7 @@ class FastDCABot:
     async def set_ladder_step_percent_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not await self._check_user_fast(update):
             return LADDER_MENU
-        await update.message.reply_text(
-            f"📊 Введите шаг падения в процентах (3-10%):",
-            reply_markup=self.get_cancel_keyboard(),
-            parse_mode='Markdown'
-        )
+        await update.message.reply_text("📊 Введите шаг падения в процентах (3-10%):", reply_markup=self.get_cancel_keyboard(), parse_mode='Markdown')
         return SET_LADDER_STEP_PERCENT
     
     async def set_ladder_step_percent_save(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1492,11 +1600,7 @@ class FastDCABot:
     async def set_ladder_steps_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not await self._check_user_fast(update):
             return LADDER_MENU
-        await update.message.reply_text(
-            f"🔢 Введите количество ступеней (3-10):",
-            reply_markup=self.get_cancel_keyboard(),
-            parse_mode='Markdown'
-        )
+        await update.message.reply_text("🔢 Введите количество ступеней (3-10):", reply_markup=self.get_cancel_keyboard(), parse_mode='Markdown')
         return SET_LADDER_STEPS
     
     async def set_ladder_steps_save(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1521,11 +1625,7 @@ class FastDCABot:
     async def set_ladder_multiplier_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not await self._check_user_fast(update):
             return LADDER_MENU
-        await update.message.reply_text(
-            f"📈 Введите множитель суммы (1.5-3):",
-            reply_markup=self.get_cancel_keyboard(),
-            parse_mode='Markdown'
-        )
+        await update.message.reply_text("📈 Введите множитель суммы (1.5-3):", reply_markup=self.get_cancel_keyboard(), parse_mode='Markdown')
         return SET_LADDER_MULTIPLIER
     
     async def set_ladder_multiplier_save(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1550,11 +1650,7 @@ class FastDCABot:
     async def set_ladder_base_amount_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not await self._check_user_fast(update):
             return LADDER_MENU
-        await update.message.reply_text(
-            f"💵 Введите базовую сумму (мин 1 USDT):",
-            reply_markup=self.get_cancel_keyboard(),
-            parse_mode='Markdown'
-        )
+        await update.message.reply_text("💵 Введите базовую сумму (мин 1 USDT):", reply_markup=self.get_cancel_keyboard(), parse_mode='Markdown')
         return SET_LADDER_BASE_AMOUNT
     
     async def set_ladder_base_amount_save(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1665,8 +1761,10 @@ class FastDCABot:
             await update.message.reply_text("❌ Bybit API не инициализирован.")
             return ConversationHandler.END
         symbol = self.db.get_setting('symbol', 'TONUSDT')
-        open_orders = await self.bybit.get_open_orders(symbol)
-        await update.message.reply_text(f"📝 *Управление ордерами*\n\nТокен: `{symbol}`\nОткрытых ордеров: `{len(open_orders)}`", reply_markup=self.get_orders_management_keyboard(), parse_mode='Markdown')
+        orders_by_side = await self.bybit.get_open_orders_by_side(symbol)
+        sell_count = len(orders_by_side.get('sell', []))
+        buy_count = len(orders_by_side.get('buy', []))
+        await update.message.reply_text(f"📝 *Управление ордерами*\n\nТокен: `{symbol}`\n📊 Ордера на продажу: `{sell_count}`\n📊 Ордера на покупку: `{buy_count}`", reply_markup=self.get_orders_management_keyboard(), parse_mode='Markdown')
         return MANAGE_ORDERS
     
     async def list_orders(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1677,15 +1775,35 @@ class FastDCABot:
             await update.message.reply_text("❌ Bybit API не инициализирован.")
             return MANAGE_ORDERS
         symbol = self.db.get_setting('symbol', 'TONUSDT')
-        open_orders = await self.bybit.get_open_orders(symbol)
-        if not open_orders:
-            await update.message.reply_text("📋 Нет открытых ордеров", reply_markup=self.get_orders_management_keyboard())
-            return MANAGE_ORDERS
-        message = f"📋 *Открытые ордера ({len(open_orders)})*\n\n"
-        for i, order in enumerate(open_orders[:10], 1):
-            price = float(order.get('price', 0))
-            qty = float(order.get('qty', 0))
-            message += f"*{i}.* `{order.get('orderId', 'N/A')[:8]}` - `{format_quantity(qty, 6)}` @ `{format_price(price, 4)}`\n"
+        orders_by_side = await self.bybit.get_open_orders_by_side(symbol)
+        
+        message = f"📋 *СПИСОК ОРДЕРОВ*\n\n"
+        
+        # Ордера на продажу
+        sell_orders = orders_by_side.get('sell', [])
+        if sell_orders:
+            message += f"🔴 *ОРДЕРА НА ПРОДАЖУ ({len(sell_orders)})*\n"
+            for i, order in enumerate(sell_orders[:10], 1):
+                price = float(order.get('price', 0))
+                qty = float(order.get('qty', 0))
+                order_id = order.get('orderId', 'N/A')[:8]
+                message += f"{i}. `{order_id}` - {format_quantity(qty, 6)} @ {format_price(price, 4)}\n"
+            message += f"\n"
+        else:
+            message += f"🔴 *Нет ордеров на продажу*\n\n"
+        
+        # Ордера на покупку
+        buy_orders = orders_by_side.get('buy', [])
+        if buy_orders:
+            message += f"🟢 *ОРДЕРА НА ПОКУПКУ ({len(buy_orders)})*\n"
+            for i, order in enumerate(buy_orders[:10], 1):
+                price = float(order.get('price', 0))
+                qty = float(order.get('qty', 0))
+                order_id = order.get('orderId', 'N/A')[:8]
+                message += f"{i}. `{order_id}` - {format_quantity(qty, 6)} @ {format_price(price, 4)}\n"
+        else:
+            message += f"🟢 *Нет ордеров на покупку*"
+        
         await update.message.reply_text(message, parse_mode='Markdown')
         return MANAGE_ORDERS
     
@@ -1705,7 +1823,9 @@ class FastDCABot:
         for i, order in enumerate(open_orders[:10], 1):
             order_id = order.get('orderId', 'N/A')
             price = float(order.get('price', 0))
-            keyboard.append([InlineKeyboardButton(f"❌ Удалить #{i} ({format_price(price, 4)})", callback_data=f"order_delete_{order_id}")])
+            side = order.get('side', 'Unknown')
+            side_emoji = "🔴" if side == "Sell" else "🟢"
+            keyboard.append([InlineKeyboardButton(f"{side_emoji} Удалить #{i} ({format_price(price, 4)})", callback_data=f"order_delete_{order_id}")])
         keyboard.append([InlineKeyboardButton("🔙 Отмена", callback_data="order_cancel")])
         await update.message.reply_text("❌ *Выберите ордер для удаления:*", reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
         return MANAGE_ORDERS
@@ -1727,7 +1847,9 @@ class FastDCABot:
             order_id = order.get('orderId', 'N/A')
             price = float(order.get('price', 0))
             qty = float(order.get('qty', 0))
-            keyboard.append([InlineKeyboardButton(f"✏️ Изменить #{i} ({format_price(price, 4)})", callback_data=f"order_edit_{order_id}_{price}_{qty}")])
+            side = order.get('side', 'Unknown')
+            side_emoji = "🔴" if side == "Sell" else "🟢"
+            keyboard.append([InlineKeyboardButton(f"{side_emoji} Изменить #{i} ({format_price(price, 4)})", callback_data=f"order_edit_{order_id}_{price}_{qty}")])
         keyboard.append([InlineKeyboardButton("🔙 Отмена", callback_data="order_cancel")])
         await update.message.reply_text("✏️ *Выберите ордер для изменения цены:*", reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
         return MANAGE_ORDERS
@@ -2403,7 +2525,7 @@ class FastDCABot:
         self.application.add_handler(MessageHandler(filters.Regex('^(📉 Текущая цена)$'), self.show_price))
         self.application.add_handler(MessageHandler(filters.Regex('^(🔔 Уведомления)$'), self.notification_settings_menu))
         
-        # Conversation для лестницы - ВАЖНО: обработчик должен возвращать LADDER_MENU
+        # Conversation для лестницы
         ladder_conv = ConversationHandler(
             entry_points=[MessageHandler(filters.Regex('^(🪜 Настройка лестницы)$'), self.ladder_settings_menu)],
             states={
@@ -2429,7 +2551,7 @@ class FastDCABot:
         )
         self.application.add_handler(ladder_conv)
         
-        # Остальные ConversationHandler
+        # Основной ConversationHandler для настроек
         main_conv = ConversationHandler(
             entry_points=[MessageHandler(filters.Regex('^(⚙️ Настройки)$'), self.settings_menu)],
             states={
@@ -2465,6 +2587,7 @@ class FastDCABot:
         )
         self.application.add_handler(main_conv)
         
+        # Управление ордерами
         orders_conv = ConversationHandler(
             entry_points=[MessageHandler(filters.Regex('^(📝 Управление ордерами)$'), self.orders_menu)],
             states={
@@ -2482,6 +2605,7 @@ class FastDCABot:
         )
         self.application.add_handler(orders_conv)
         
+        # Ручная покупка
         manual_limit_conv = ConversationHandler(
             entry_points=[MessageHandler(filters.Regex('^(💰 Ручная покупка \(лимит\))$'), self.manual_buy_start)],
             states={
@@ -2494,6 +2618,7 @@ class FastDCABot:
         )
         self.application.add_handler(manual_limit_conv)
         
+        # Ручное добавление покупки
         manual_add_conv = ConversationHandler(
             entry_points=[MessageHandler(filters.Regex('^(➕ Добавить покупку вручную)$'), self.manual_add_start)],
             states={
@@ -2506,6 +2631,7 @@ class FastDCABot:
         )
         self.application.add_handler(manual_add_conv)
         
+        # Редактирование покупок
         edit_purchases_conv = ConversationHandler(
             entry_points=[MessageHandler(filters.Regex('^(✏️ Редактировать покупки)$'), self.edit_purchases_list)],
             states={
